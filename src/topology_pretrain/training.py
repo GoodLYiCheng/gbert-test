@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
+import os
 import random
 import time
 from collections import deque
@@ -77,6 +79,11 @@ def _family_schedule(coverage: CoverageController) -> tuple[str, ...]:
     return tuple(tickets)
 
 
+def _worker_ready(_: int) -> int:
+    """Top-level spawn-safe worker warmup function."""
+    return os.getpid()
+
+
 class _ImmediateFuture:
     def __init__(self, value) -> None:
         self.value = value
@@ -94,7 +101,11 @@ class SamplePrefetcher:
         # Keep at least two batch jobs per worker queued; otherwise a setting
         # such as workers=8/prefetch=4 leaves half the CPU generator idle.
         self.depth = max(1, self.workers * 2, int(config.get("prefetch_batches", 1)))
-        self.pool = ProcessPoolExecutor(max_workers=self.workers) if self.workers > 0 else None
+        # Never fork after CUDA initialization: it can deadlock worker startup
+        # on Linux. Spawn and warm every worker before the model reaches CUDA.
+        self.pool = ProcessPoolExecutor(max_workers=self.workers, mp_context=mp.get_context("spawn")) if self.workers > 0 else None
+        if self.pool:
+            list(self.pool.map(_worker_ready, range(self.workers)))
         self.pending: dict[int, Future] = {}
 
     def submit(self, start: int, count: int, split: str, families) -> None:
@@ -120,20 +131,22 @@ def _fixed_samples(config: dict, split: str, size: int, families=None):
     workers = int(config.get("data_workers", 0))
     if workers <= 0:
         return [make_sample_from_args(item) for item in args]
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as pool:
         return list(pool.map(make_sample_from_args, args, chunksize=8))
 
 
 def train(config: dict, run_dir: Path) -> dict:
-    run_dir.mkdir(parents=True, exist_ok=True); device = _device(config["device"])
+    run_dir.mkdir(parents=True, exist_ok=True)
     random.seed(config["seed"]); np.random.seed(config["seed"]); torch.manual_seed(config["seed"])
+    # Starts Python workers before CUDA context/model construction.
+    prefetcher = SamplePrefetcher(config)
+    device = _device(config["device"])
     model = TopologyEncoder(config["hidden_dim"]).to(device); head = StatHead(config["hidden_dim"]).to(device)
     optimizer = torch.optim.AdamW(list(model.parameters()) + list(head.parameters()), lr=config["learning_rate"], weight_decay=config["weight_decay"])
     coverage = CoverageController(); best = {"spearman": -float("inf")}; history = deque(maxlen=int(config["stability_evals"]))
     batches = range(0, int(config["max_anchors"]), int(config["batch_size"])); iterator = batches if config.get("no_progress") else trange(0, int(config["max_anchors"]), int(config["batch_size"]), desc="anchors")
     schedule: tuple[str, ...] = TRAIN_FAMILIES
     schedule_block = -1
-    prefetcher = SamplePrefetcher(config)
     timing = {"wait_seconds": 0.0, "gpu_seconds": 0.0, "batches": 0}
     try:
         for start in iterator:
