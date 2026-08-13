@@ -38,7 +38,7 @@ The trainer constructs perturbations directly while protecting the root BFS tree
 so it does not retry hundreds of NetworkX candidates per graph. CPU graph
 generation is prefetched by `data_workers` processes while the main process
 runs the GNN on the GPU. The stable Stage 1 V100 baseline uses `batch_size: 256`,
-`data_workers: 8`, and `prefetch_batches: 8`. `configs/v100_32gb.yaml` raises
+`data_workers: 16`, and `prefetch_batches: 16` on a 24-core host. `configs/v100_32gb.yaml` raises
 this to batch size 1024 and 20 workers for a 32 GB V100 with at least 20 CPU cores.
 
 On a shared machine, set `data_workers` to at most the number of CPU cores you

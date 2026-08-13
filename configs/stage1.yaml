@@ -5,8 +5,8 @@ output_dir: artifacts
 hidden_dim: 128
 # Stable V100 baseline for a 24-core, 48 GB host.
 batch_size: 256
-data_workers: 8
-prefetch_batches: 8
+data_workers: 16
+prefetch_batches: 16
 worker_timeout_seconds: 300
 learning_rate: 0.001
 weight_decay: 0.0001

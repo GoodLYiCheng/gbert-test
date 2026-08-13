@@ -139,14 +139,28 @@ def permute(rooted: RootedGraph, rng: np.random.Generator) -> RootedGraph:
 
 
 def rooted_isomorphic(a: RootedGraph, b: RootedGraph) -> bool:
-    ga, gb = a.graph.copy(), b.graph.copy()
-    nx.set_node_attributes(ga, {n: n == a.root for n in ga}, "is_root")
-    nx.set_node_attributes(gb, {n: n == b.root for n in gb}, "is_root")
-    ha = nx.weisfeiler_lehman_graph_hash(ga, node_attr="is_root")
-    hb = nx.weisfeiler_lehman_graph_hash(gb, node_attr="is_root")
-    if ha != hb:
+    ga, gb = a.graph, b.graph
+    # These invariants reject the overwhelming majority of perturbations
+    # before WL hashing or VF2, without changing exact-isomorphism semantics.
+    if ga.number_of_nodes() != gb.number_of_nodes() or ga.number_of_edges() != gb.number_of_edges():
         return False
-    return nx.is_isomorphic(ga, gb, node_match=lambda x, y: x["is_root"] == y["is_root"])
+    if ga.degree[a.root] != gb.degree[b.root]:
+        return False
+    if sorted(dict(ga.degree()).values()) != sorted(dict(gb.degree()).values()):
+        return False
+    marker = "__topology_root__"
+    nx.set_node_attributes(ga, False, marker); ga.nodes[a.root][marker] = True
+    nx.set_node_attributes(gb, False, marker); gb.nodes[b.root][marker] = True
+    try:
+        ha = nx.weisfeiler_lehman_graph_hash(ga, node_attr=marker)
+        hb = nx.weisfeiler_lehman_graph_hash(gb, node_attr=marker)
+        return ha == hb and nx.is_isomorphic(
+            ga, gb, node_match=lambda x, y: x[marker] == y[marker]
+        )
+    finally:
+        for graph in (ga, gb):
+            for node in graph:
+                graph.nodes[node].pop(marker, None)
 
 
 def _protected_bfs_edges(g: nx.Graph, root: int) -> set[tuple[int, int]]:
@@ -201,8 +215,9 @@ def perturb(rooted: RootedGraph, target: float, rng: np.random.Generator, tolera
     assert valid_rooted(out.graph, out.root)
     # rooted_isomorphic first rejects unequal WL hashes, then performs the exact
     # rooted check required by the supervision contract.
-    actual = 0.0 if rooted_isomorphic(rooted, out) else distance
-    return out, actual, added | removed
+    changed = added | removed
+    actual = 0.0 if not changed or rooted_isomorphic(rooted, out) else distance
+    return out, actual, changed
 
 
 def to_data(rooted: RootedGraph) -> Data:
