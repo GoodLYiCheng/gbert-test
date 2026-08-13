@@ -42,14 +42,13 @@ def _loss(model, head, batch, margin: float, lambda_rank: float, lambda_stat: fl
 
 
 @torch.no_grad()
-def evaluate(model, head, config: dict, split: str, size: int, ood: bool = False) -> dict:
+def evaluate(model, head, config: dict, split: str, size: int, ood: bool = False, cached_batches=None) -> dict:
     device = next(model.parameters()).device; model.eval(); head.eval()
     predictions: list[float] = []; targets: list[float] = []; ranks: list[bool] = []; isos: list[float] = []; losses: list[float] = []
     batch_size = int(config["batch_size"])
-    fixed_samples = _fixed_samples(config, split, size, OOD_FAMILIES if ood else None)
-    for start in range(0, size, batch_size):
-        samples = fixed_samples[start:start + batch_size]
-        b = move_packed_batch(pack_samples(samples), device); loss, _ = _loss(model, head, b, config["ranking_margin"], config["lambda_rank"], config["lambda_stat"])
+    batches = cached_batches if cached_batches is not None else _fixed_packed_batches(config, split, size, OOD_FAMILIES if ood else None)
+    for cpu_batch in batches:
+        b = move_packed_batch(cpu_batch, device); loss, _ = _loss(model, head, b, config["ranking_margin"], config["lambda_rank"], config["lambda_stat"])
         z0, zi, za, zb = model(b["graphs"]).split(b["size"], dim=0)
         ca, cb = F.cosine_similarity(z0, za), F.cosine_similarity(z0, zb)
         predictions.extend(torch.cat([ca, cb]).cpu().tolist()); targets.extend(torch.cat([1-b["d_a"], 1-b["d_b"]]).cpu().tolist())
@@ -124,20 +123,31 @@ class SamplePrefetcher:
             self.pool.shutdown(wait=True, cancel_futures=True)
 
 
-def _fixed_samples(config: dict, split: str, size: int, families=None):
-    """Parallel deterministic fixed-set generation for validation and test."""
-    args = [(config["seed"], split, i, config["generator_version"], config["perturb_tolerance"],
-             config["perturb_attempts"], families) for i in range(size)]
+def _fixed_packed_batches(config: dict, split: str, size: int, families=None):
+    """Build deterministic compact batches once, without nested worker pools."""
+    batch_size = int(config["batch_size"])
+    args = [[(config["seed"], split, sample_id, config["generator_version"], config["perturb_tolerance"],
+              config["perturb_attempts"], families)
+             for sample_id in range(start, min(start + batch_size, size))]
+            for start in range(0, size, batch_size)]
     workers = int(config.get("data_workers", 0))
     if workers <= 0:
-        return [make_sample_from_args(item) for item in args]
+        return [make_packed_batch_from_args(item) for item in args]
     with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as pool:
-        return list(pool.map(make_sample_from_args, args, chunksize=8))
+        return list(pool.map(make_packed_batch_from_args, args, chunksize=1))
 
 
 def train(config: dict, run_dir: Path) -> dict:
     run_dir.mkdir(parents=True, exist_ok=True)
     random.seed(config["seed"]); np.random.seed(config["seed"]); torch.manual_seed(config["seed"])
+    # The validation set must be fixed, but rebuilding 50k NetworkX pairs at
+    # every evaluation causes an apparent 1%-progress deadlock. Build compact
+    # CPU batches once before training workers/CUDA exist, then reuse them.
+    validation_batches = None
+    if config.get("cache_validation", True):
+        print(f"Preparing fixed validation cache ({config['val_size']} anchors)...", flush=True)
+        validation_batches = _fixed_packed_batches(config, "validation", config["val_size"])
+        torch.save(validation_batches, run_dir / "validation_cache.pt")
     # Starts Python workers before CUDA context/model construction.
     prefetcher = SamplePrefetcher(config)
     device = _device(config["device"])
@@ -178,7 +188,7 @@ def train(config: dict, run_dir: Path) -> dict:
                                      cpu_wait=f"{timing['wait_seconds']/timing['batches']:.3f}s",
                                      gpu=f"{timing['gpu_seconds']/timing['batches']:.3f}s")
             if consumed % config["eval_every"] < batch["size"]:
-                metrics = evaluate(model, head, config, "validation", config["val_size"]); metrics["consumed_anchors"] = consumed
+                metrics = evaluate(model, head, config, "validation", config["val_size"], cached_batches=validation_batches); metrics["consumed_anchors"] = consumed
                 history.append(metrics)
                 (run_dir / "validation_history.jsonl").open("a", encoding="utf-8").write(json.dumps(metrics) + "\n")
                 if metrics["spearman"] > best["spearman"]:

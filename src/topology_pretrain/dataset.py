@@ -67,6 +67,9 @@ def make_packed_batch_from_args(args: tuple) -> dict:
 
 
 def move_packed_batch(batch: dict, device: torch.device) -> dict:
+    # PyG Batch.to() mutates in place. Clone cache-backed tensors/graphs so a
+    # fixed validation cache remains CPU-resident across every evaluation.
+    batch = {key: (value.clone() if hasattr(value, "clone") else value) for key, value in batch.items()}
     if device.type == "cuda":
         batch = {key: (value.pin_memory() if hasattr(value, "pin_memory") else value) for key, value in batch.items()}
     return {key: (value.to(device, non_blocking=True) if hasattr(value, "to") else value)

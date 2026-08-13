@@ -15,6 +15,7 @@ min_anchors: 128
 eval_every: 64
 checkpoint_every: 128
 val_size: 64
+cache_validation: true
 id_test_size: 64
 ood_test_size: 64
 perturb_tolerance: 0.02

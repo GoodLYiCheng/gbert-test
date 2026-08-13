@@ -14,7 +14,9 @@ max_anchors: 10000000
 min_anchors: 2000000
 eval_every: 100000
 checkpoint_every: 100000
-val_size: 50000
+# Fixed model-selection set, built once before training and reused at each eval.
+val_size: 5000
+cache_validation: true
 id_test_size: 50000
 ood_test_size: 50000
 perturb_tolerance: 0.02
