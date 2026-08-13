@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from torch_geometric.data import Batch
+from torch_geometric.data import Batch, Data
 
 from .graphs import RootedGraph, descriptors, perturb, permute, sample_rooted_graph, stats, to_data
 
@@ -41,32 +41,75 @@ def make_sample_from_args(args: tuple) -> PairSample:
     return make_sample(*args)
 
 
-def pack_samples(samples: list[PairSample]) -> dict:
-    """Serialize one compact CPU batch instead of NetworkX graphs per sample.
+def pack_samples_numpy(samples: list[PairSample]) -> dict:
+    """Return a pure-NumPy batch safe for cross-process transfer.
 
-    The four graph views are combined into one PyG Batch. This removes the
-    ProcessPoolExecutor pickle overhead of NetworkX objects and permits one GNN
-    forward pass for anchor, isomorphic, and both perturbed views.
+    Returning torch tensors from ProcessPoolExecutor uses /dev/shm and file
+    descriptors. Container shared-memory limits can deadlock even when regular
+    RAM is plentiful, so workers return only pickle-owned NumPy arrays.
     """
     views = ("anchor", "iso", "a", "b")
-    graphs = Batch.from_data_list([to_data(getattr(sample, view)) for view in views for sample in samples])
+    edge_parts: list[np.ndarray] = []
+    roots: list[int] = []
+    batch_parts: list[np.ndarray] = []
+    node_offset = 0
+    graph_index = 0
+    for view in views:
+        for sample in samples:
+            rooted = getattr(sample, view)
+            edges = np.asarray(list(rooted.graph.edges()), dtype=np.int32)
+            if edges.size:
+                directed = np.concatenate((edges, edges[:, ::-1]), axis=0).T
+            else:
+                directed = np.empty((2, 0), dtype=np.int32)
+            edge_parts.append(directed + node_offset)
+            roots.append(node_offset + rooted.root)
+            node_count = rooted.graph.number_of_nodes()
+            batch_parts.append(np.full(node_count, graph_index, dtype=np.int32))
+            node_offset += node_count
+            graph_index += 1
     return {
-        "graphs": graphs,
-        "d_a": torch.tensor([s.d_a for s in samples], dtype=torch.float32),
-        "d_b": torch.tensor([s.d_b for s in samples], dtype=torch.float32),
-        "stats": torch.tensor(np.stack([s.stat for s in samples]), dtype=torch.float32),
+        "edge_index": np.concatenate(edge_parts, axis=1) if edge_parts else np.empty((2, 0), dtype=np.int32),
+        "roots": np.asarray(roots, dtype=np.int64),
+        "batch_index": np.concatenate(batch_parts),
+        "num_nodes": node_offset,
+        "d_a": np.asarray([s.d_a for s in samples], dtype=np.float32),
+        "d_b": np.asarray([s.d_b for s in samples], dtype=np.float32),
+        "stats": np.stack([s.stat for s in samples]).astype(np.float32, copy=False),
         "descriptors": [s.desc for s in samples],
         "size": len(samples),
     }
 
 
 def make_packed_batch_from_args(args: tuple) -> dict:
-    """Worker entry point: generate and compact an entire batch in the worker."""
-    sample_args = args
-    return pack_samples([make_sample_from_args(item) for item in sample_args])
+    """Worker entry point returning no NetworkX/PyG/torch objects."""
+    return pack_samples_numpy([make_sample_from_args(item) for item in args])
+
+
+def numpy_batch_to_cpu(batch: dict) -> dict:
+    """Construct the PyG object only in the main process."""
+    root_mask = torch.zeros(int(batch["num_nodes"]), dtype=torch.bool)
+    root_mask[torch.from_numpy(batch["roots"])] = True
+    graphs = Data(edge_index=torch.from_numpy(batch["edge_index"]).long(), root_mask=root_mask,
+                  batch=torch.from_numpy(batch["batch_index"]).long(), num_nodes=int(batch["num_nodes"]))
+    return {
+        "graphs": graphs,
+        "d_a": torch.from_numpy(batch["d_a"]),
+        "d_b": torch.from_numpy(batch["d_b"]),
+        "stats": torch.from_numpy(batch["stats"]),
+        "descriptors": batch["descriptors"],
+        "size": batch["size"],
+    }
+
+
+def pack_samples(samples: list[PairSample]) -> dict:
+    """Main-process convenience wrapper retained for tests/evaluation."""
+    return numpy_batch_to_cpu(pack_samples_numpy(samples))
 
 
 def move_packed_batch(batch: dict, device: torch.device) -> dict:
+    if "edge_index" in batch:
+        batch = numpy_batch_to_cpu(batch)
     # PyG Batch.to() mutates in place. Clone cache-backed tensors/graphs so a
     # fixed validation cache remains CPU-resident across every evaluation.
     batch = {key: (value.clone() if hasattr(value, "clone") else value) for key, value in batch.items()}

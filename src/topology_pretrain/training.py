@@ -7,7 +7,8 @@ import os
 import random
 import time
 from collections import deque
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -83,11 +84,24 @@ def _worker_ready(_: int) -> int:
     return os.getpid()
 
 
+def _terminate_executor(pool: ProcessPoolExecutor) -> list[dict]:
+    """Stop a broken pool without waiting forever for its workers."""
+    processes = getattr(pool, "_processes", {})
+    states = [{"pid": process.pid, "alive": process.is_alive(), "exitcode": process.exitcode}
+              for process in processes.values()]
+    for process in processes.values():
+        if process.is_alive():
+            process.terminate()
+    pool.shutdown(wait=False, cancel_futures=True)
+    return states
+
+
 class _ImmediateFuture:
     def __init__(self, value) -> None:
         self.value = value
 
-    def result(self):
+    def result(self, timeout=None):
+        del timeout
         return self.value
 
 
@@ -97,14 +111,24 @@ class SamplePrefetcher:
     def __init__(self, config: dict) -> None:
         self.config = config
         self.workers = int(config.get("data_workers", 0))
-        # Keep at least two batch jobs per worker queued; otherwise a setting
-        # such as workers=8/prefetch=4 leaves half the CPU generator idle.
-        self.depth = max(1, self.workers * 2, int(config.get("prefetch_batches", 1)))
+        # A large queue of completed tensor batches can exhaust /dev/shm or
+        # file descriptors in containers. Keep no more than one queued batch
+        # per worker; workers return NumPy payloads rather than torch tensors.
+        requested_depth = int(config.get("prefetch_batches", max(1, self.workers)))
+        self.depth = max(1, min(requested_depth, max(1, self.workers)))
+        self.timeout = float(config.get("worker_timeout_seconds", 300))
         # Never fork after CUDA initialization: it can deadlock worker startup
         # on Linux. Spawn and warm every worker before the model reaches CUDA.
         self.pool = ProcessPoolExecutor(max_workers=self.workers, mp_context=mp.get_context("spawn")) if self.workers > 0 else None
         if self.pool:
-            list(self.pool.map(_worker_ready, range(self.workers)))
+            warmups = [self.pool.submit(_worker_ready, index) for index in range(self.workers)]
+            try:
+                for future in warmups:
+                    future.result(timeout=self.timeout)
+            except (FutureTimeoutError, BrokenProcessPool) as exc:
+                states = _terminate_executor(self.pool)
+                self.pool = None
+                raise RuntimeError(f"Data worker startup failed; worker states: {states}") from exc
         self.pending: dict[int, Future] = {}
 
     def submit(self, start: int, count: int, split: str, families) -> None:
@@ -116,11 +140,37 @@ class SamplePrefetcher:
         self.pending[start] = self.pool.submit(make_packed_batch_from_args, args) if self.pool else _ImmediateFuture(make_packed_batch_from_args(args))
 
     def take(self, start: int):
-        return self.pending.pop(start).result()
+        future = self.pending.pop(start)
+        try:
+            return future.result(timeout=self.timeout)
+        except (FutureTimeoutError, BrokenProcessPool) as exc:
+            states = self.worker_states()
+            self.abort()
+            raise RuntimeError(
+                f"Data worker batch {start} did not complete within "
+                f"{self.timeout:g}s; worker states: {states}"
+            ) from exc
+        except Exception:
+            self.abort()
+            raise
+
+    def worker_states(self) -> list[dict]:
+        if not self.pool:
+            return []
+        processes = getattr(self.pool, "_processes", {})
+        return [{"pid": process.pid, "alive": process.is_alive(), "exitcode": process.exitcode}
+                for process in processes.values()]
+
+    def abort(self) -> None:
+        if not self.pool:
+            return
+        _terminate_executor(self.pool)
+        self.pool = None
 
     def close(self) -> None:
         if self.pool:
             self.pool.shutdown(wait=True, cancel_futures=True)
+            self.pool = None
 
 
 def _fixed_packed_batches(config: dict, split: str, size: int, families=None):
@@ -133,8 +183,19 @@ def _fixed_packed_batches(config: dict, split: str, size: int, families=None):
     workers = int(config.get("data_workers", 0))
     if workers <= 0:
         return [make_packed_batch_from_args(item) for item in args]
-    with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as pool:
-        return list(pool.map(make_packed_batch_from_args, args, chunksize=1))
+    pool = ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn"))
+    futures = [pool.submit(make_packed_batch_from_args, item) for item in args]
+    timeout = float(config.get("worker_timeout_seconds", 300))
+    try:
+        batches = [future.result(timeout=timeout) for future in futures]
+    except (FutureTimeoutError, BrokenProcessPool) as exc:
+        states = _terminate_executor(pool)
+        raise RuntimeError(f"Fixed-split worker failed; worker states: {states}") from exc
+    except Exception:
+        _terminate_executor(pool)
+        raise
+    pool.shutdown(wait=True, cancel_futures=True)
+    return batches
 
 
 def train(config: dict, run_dir: Path) -> dict:

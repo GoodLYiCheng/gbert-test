@@ -199,6 +199,8 @@ def perturb(rooted: RootedGraph, target: float, rng: np.random.Generator, tolera
     out = RootedGraph(g, rooted.root, rooted.family, rooted.sample_id)
     # The direct construction is valid by the protected BFS tree invariant.
     assert valid_rooted(out.graph, out.root)
+    # rooted_isomorphic first rejects unequal WL hashes, then performs the exact
+    # rooted check required by the supervision contract.
     actual = 0.0 if rooted_isomorphic(rooted, out) else distance
     return out, actual, added | removed
 

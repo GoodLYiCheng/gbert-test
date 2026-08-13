@@ -3,10 +3,11 @@ generator_version: topology-v1
 device: auto
 output_dir: artifacts
 hidden_dim: 128
-# V100 baseline. Lower batch_size to 256 only if memory is exhausted.
-batch_size: 512
-data_workers: 16
-prefetch_batches: 32
+# Stable V100 baseline for a 24-core, 48 GB host.
+batch_size: 256
+data_workers: 8
+prefetch_batches: 8
+worker_timeout_seconds: 300
 learning_rate: 0.001
 weight_decay: 0.0001
 grad_clip: 1.0

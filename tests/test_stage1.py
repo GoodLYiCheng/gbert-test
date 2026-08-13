@@ -3,7 +3,7 @@ import networkx as nx
 import torch
 from torch_geometric.data import Batch
 
-from topology_pretrain.dataset import collate, make_sample
+from topology_pretrain.dataset import collate, make_packed_batch_from_args, make_sample
 from topology_pretrain.graphs import (OOD_FAMILIES, TRAIN_FAMILIES, edge_jaccard,
                                       edge_set, permute, rooted_isomorphic,
                                       sample_rooted_graph, valid_rooted, perturb)
@@ -75,3 +75,11 @@ def test_packed_batch_contains_four_graph_views():
     packed = pack_samples(samples)
     assert packed["size"] == 2
     assert packed["graphs"].root_mask.sum().item() == 8
+
+
+def test_worker_batch_payload_contains_no_torch_objects():
+    args = [(37, "train", 0, "topology-v1", .02, 1, None)]
+    packed = make_packed_batch_from_args(args)
+    assert isinstance(packed["edge_index"], np.ndarray)
+    assert isinstance(packed["roots"], np.ndarray)
+    assert not any(torch.is_tensor(value) for value in packed.values())
