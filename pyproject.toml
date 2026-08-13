@@ -21,8 +21,8 @@ dependencies = [
     "networkx>=3.1,<4.0",
     "PyYAML>=6.0,<7.0",
     "tqdm>=4.65,<5.0",
-    "torch>=1.13,<2.1",
-    "torch-geometric>=2.5,<2.6",
+    "torch>=2.6,<2.7",
+    "torch-geometric>=2.6,<2.7",
 ]
 
 [project.optional-dependencies]

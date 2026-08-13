@@ -1,4 +1,4 @@
-# Runtime dependencies tested with Python 3.10, CUDA 11.7, PyTorch 1.13.0 and PyG 2.5.2.
+# Runtime dependencies for the target Python 3.10, CUDA 12.6, PyTorch 2.6.0 and PyG 2.6.x image.
 # Install the matching CUDA build of torch and torch-geometric first when using a GPU;
 # see README.md for the official PyG wheel command.
 numpy>=1.23,<2.0
@@ -6,8 +6,8 @@ scipy>=1.10,<2.0
 networkx>=3.1,<4.0
 PyYAML>=6.0,<7.0
 tqdm>=4.65,<5.0
-torch>=1.13,<2.1
-torch-geometric>=2.5,<2.6
+torch>=2.6,<2.7
+torch-geometric>=2.6,<2.7
 
 # Test-only dependency
 pytest>=7.0,<9.0
