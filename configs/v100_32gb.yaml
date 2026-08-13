@@ -1,12 +1,12 @@
+# Aggressive single-V100 profile; requires a 32 GB V100 and at least 20 CPU cores.
 seed: 20260813
 generator_version: topology-v1
-device: auto
+device: cuda
 output_dir: artifacts
 hidden_dim: 128
-# V100 baseline. Lower batch_size to 256 only if memory is exhausted.
-batch_size: 512
-data_workers: 16
-prefetch_batches: 32
+batch_size: 1024
+data_workers: 20
+prefetch_batches: 40
 learning_rate: 0.001
 weight_decay: 0.0001
 grad_clip: 1.0
@@ -18,7 +18,6 @@ val_size: 50000
 id_test_size: 50000
 ood_test_size: 50000
 perturb_tolerance: 0.02
-# Retained only for manifest compatibility. Direct perturbation uses one pass.
 perturb_attempts: 1
 ranking_margin: 0.05
 lambda_rank: 1.0

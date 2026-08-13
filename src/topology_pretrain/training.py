@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import random
+import time
 from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
 from datetime import datetime, timezone
@@ -15,7 +16,8 @@ from torch.nn import functional as F
 from tqdm import trange
 
 from .coverage import CoverageController
-from .dataset import collate, make_sample, make_sample_from_args
+from .dataset import (collate, make_packed_batch_from_args, make_sample,
+                      make_sample_from_args, move_packed_batch, pack_samples)
 from .graphs import OOD_FAMILIES, TRAIN_FAMILIES
 from .model import StatHead, TopologyEncoder
 
@@ -25,8 +27,7 @@ def _device(value: str) -> torch.device:
 
 
 def _loss(model, head, batch, margin: float, lambda_rank: float, lambda_stat: float):
-    z0, zi = model(batch["anchor"]), model(batch["iso"])
-    za, zb = model(batch["a"]), model(batch["b"])
+    z0, zi, za, zb = model(batch["graphs"]).split(batch["size"], dim=0)
     c_iso = F.cosine_similarity(z0, zi); c_a = F.cosine_similarity(z0, za); c_b = F.cosine_similarity(z0, zb)
     sim = (F.smooth_l1_loss(c_iso, torch.ones_like(c_iso), beta=.1) +
            F.smooth_l1_loss(c_a, 1 - batch["d_a"], beta=.1) +
@@ -46,8 +47,8 @@ def evaluate(model, head, config: dict, split: str, size: int, ood: bool = False
     fixed_samples = _fixed_samples(config, split, size, OOD_FAMILIES if ood else None)
     for start in range(0, size, batch_size):
         samples = fixed_samples[start:start + batch_size]
-        b = collate(samples, device); loss, _ = _loss(model, head, b, config["ranking_margin"], config["lambda_rank"], config["lambda_stat"])
-        z0, zi, za, zb = model(b["anchor"]), model(b["iso"]), model(b["a"]), model(b["b"])
+        b = move_packed_batch(pack_samples(samples), device); loss, _ = _loss(model, head, b, config["ranking_margin"], config["lambda_rank"], config["lambda_stat"])
+        z0, zi, za, zb = model(b["graphs"]).split(b["size"], dim=0)
         ca, cb = F.cosine_similarity(z0, za), F.cosine_similarity(z0, zb)
         predictions.extend(torch.cat([ca, cb]).cpu().tolist()); targets.extend(torch.cat([1-b["d_a"], 1-b["d_b"]]).cpu().tolist())
         ranks.extend(((ca > cb) == (b["d_a"] < b["d_b"])).cpu().tolist()); isos.extend(F.cosine_similarity(z0, zi).cpu().tolist()); losses.append(loss.item())
@@ -85,24 +86,27 @@ class _ImmediateFuture:
 
 
 class SamplePrefetcher:
-    """Overlap deterministic CPU graph generation with GPU optimization."""
+    """Overlap worker-side packed batch generation with GPU optimization."""
 
     def __init__(self, config: dict) -> None:
         self.config = config
         self.workers = int(config.get("data_workers", 0))
-        self.depth = max(1, int(config.get("prefetch_batches", 1)))
+        # Keep at least two batch jobs per worker queued; otherwise a setting
+        # such as workers=8/prefetch=4 leaves half the CPU generator idle.
+        self.depth = max(1, self.workers * 2, int(config.get("prefetch_batches", 1)))
         self.pool = ProcessPoolExecutor(max_workers=self.workers) if self.workers > 0 else None
         self.pending: dict[int, Future] = {}
 
-    def submit(self, sample_id: int, split: str, families) -> None:
-        if sample_id in self.pending:
+    def submit(self, start: int, count: int, split: str, families) -> None:
+        if start in self.pending:
             return
-        args = (self.config["seed"], split, sample_id, self.config["generator_version"],
-                self.config["perturb_tolerance"], self.config["perturb_attempts"], families)
-        self.pending[sample_id] = self.pool.submit(make_sample_from_args, args) if self.pool else _ImmediateFuture(make_sample(*args))
+        args = [(self.config["seed"], split, sample_id, self.config["generator_version"],
+                 self.config["perturb_tolerance"], self.config["perturb_attempts"], families)
+                for sample_id in range(start, start + count)]
+        self.pending[start] = self.pool.submit(make_packed_batch_from_args, args) if self.pool else _ImmediateFuture(make_packed_batch_from_args(args))
 
-    def take(self, sample_id: int):
-        return self.pending.pop(sample_id).result()
+    def take(self, start: int):
+        return self.pending.pop(start).result()
 
     def close(self) -> None:
         if self.pool:
@@ -130,6 +134,7 @@ def train(config: dict, run_dir: Path) -> dict:
     schedule: tuple[str, ...] = TRAIN_FAMILIES
     schedule_block = -1
     prefetcher = SamplePrefetcher(config)
+    timing = {"wait_seconds": 0.0, "gpu_seconds": 0.0, "batches": 0}
     try:
         for start in iterator:
             block = start // config["coverage_update_every"]
@@ -137,20 +142,29 @@ def train(config: dict, run_dir: Path) -> dict:
                 schedule_block = block
                 schedule = _family_schedule(coverage)
                 (run_dir / "coverage_schedule.jsonl").open("a", encoding="utf-8").write(json.dumps({"start": start, "families": schedule}) + "\n")
-            # Submit individual samples several batches ahead. This gives CPU
-            # workers enough work while the main process is executing the GNN.
+            # Batches are generated and packed in workers; no NetworkX object
+            # crosses the process boundary. Keep several future batches ready.
             prefetch_end = min(config["max_anchors"], start + config["batch_size"] * prefetcher.depth)
-            for sample_id in range(start, prefetch_end):
-                prefetcher.submit(sample_id, "train", schedule)
+            for future_start in range(start, prefetch_end, config["batch_size"]):
+                future_count = min(config["batch_size"], config["max_anchors"] - future_start)
+                prefetcher.submit(future_start, future_count, "train", schedule)
             current_end = min(config["max_anchors"], start + config["batch_size"])
-            samples = [prefetcher.take(sample_id) for sample_id in range(start, current_end)]
-            batch = collate(samples, device); model.train(); head.train(); optimizer.zero_grad()
+            wait_start = time.perf_counter()
+            batch = move_packed_batch(prefetcher.take(start), device)
+            timing["wait_seconds"] += time.perf_counter() - wait_start
+            model.train(); head.train(); optimizer.zero_grad()
+            gpu_start = time.perf_counter()
             loss, parts = _loss(model, head, batch, config["ranking_margin"], config["lambda_rank"], config["lambda_stat"]); loss.backward()
             torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(head.parameters()), config["grad_clip"]); optimizer.step()
-            for s in samples: coverage.add(s.desc)
-            consumed = start + len(samples)
-            if not config.get("no_progress"): iterator.set_postfix(loss=f"{loss.item():.4f}", sim=f"{parts['sim']:.4f}")
-            if consumed % config["eval_every"] < len(samples):
+            if device.type == "cuda": torch.cuda.synchronize(device)
+            timing["gpu_seconds"] += time.perf_counter() - gpu_start; timing["batches"] += 1
+            for desc in batch["descriptors"]: coverage.add(desc)
+            consumed = current_end
+            if not config.get("no_progress"):
+                iterator.set_postfix(loss=f"{loss.item():.4f}", sim=f"{parts['sim']:.4f}",
+                                     cpu_wait=f"{timing['wait_seconds']/timing['batches']:.3f}s",
+                                     gpu=f"{timing['gpu_seconds']/timing['batches']:.3f}s")
+            if consumed % config["eval_every"] < batch["size"]:
                 metrics = evaluate(model, head, config, "validation", config["val_size"]); metrics["consumed_anchors"] = consumed
                 history.append(metrics)
                 (run_dir / "validation_history.jsonl").open("a", encoding="utf-8").write(json.dumps(metrics) + "\n")
@@ -159,12 +173,15 @@ def train(config: dict, run_dir: Path) -> dict:
                 stable = len(history) == history.maxlen and max(x["spearman"] for x in history) - min(x["spearman"] for x in history) < config["stability_delta"] and max(x["ranking_accuracy"] for x in history) - min(x["ranking_accuracy"] for x in history) < config["stability_delta"]
                 coverage_ok = all(min(values["counts"].values()) >= config["coverage_min_count"] and values["js_divergence"] < config["coverage_js_threshold"] for values in coverage.summary().values())
                 if consumed >= config["min_anchors"] and stable and coverage_ok: break
-            if consumed % config["checkpoint_every"] < len(samples): _save(run_dir / "last.pt", model, head, optimizer, config, consumed, coverage, best)
+            if consumed % config["checkpoint_every"] < batch["size"]: _save(run_dir / "last.pt", model, head, optimizer, config, consumed, coverage, best)
     finally:
         prefetcher.close()
     _save(run_dir / "last.pt", model, head, optimizer, config, consumed, coverage, best)
     (run_dir / "coverage.json").write_text(json.dumps(coverage.summary(), indent=2), encoding="utf-8")
-    return {"best": best, "consumed_anchors": consumed, "device": str(device)}
+    timing["mean_cpu_wait_seconds"] = timing.pop("wait_seconds") / max(timing["batches"], 1)
+    timing["mean_gpu_step_seconds"] = timing.pop("gpu_seconds") / max(timing["batches"], 1)
+    (run_dir / "throughput.json").write_text(json.dumps(timing, indent=2), encoding="utf-8")
+    return {"best": best, "consumed_anchors": consumed, "device": str(device), "timing": timing}
 
 
 def load_checkpoint(path: Path, device: torch.device | str = "cpu"):

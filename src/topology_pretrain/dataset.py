@@ -41,6 +41,38 @@ def make_sample_from_args(args: tuple) -> PairSample:
     return make_sample(*args)
 
 
+def pack_samples(samples: list[PairSample]) -> dict:
+    """Serialize one compact CPU batch instead of NetworkX graphs per sample.
+
+    The four graph views are combined into one PyG Batch. This removes the
+    ProcessPoolExecutor pickle overhead of NetworkX objects and permits one GNN
+    forward pass for anchor, isomorphic, and both perturbed views.
+    """
+    views = ("anchor", "iso", "a", "b")
+    graphs = Batch.from_data_list([to_data(getattr(sample, view)) for view in views for sample in samples])
+    return {
+        "graphs": graphs,
+        "d_a": torch.tensor([s.d_a for s in samples], dtype=torch.float32),
+        "d_b": torch.tensor([s.d_b for s in samples], dtype=torch.float32),
+        "stats": torch.tensor(np.stack([s.stat for s in samples]), dtype=torch.float32),
+        "descriptors": [s.desc for s in samples],
+        "size": len(samples),
+    }
+
+
+def make_packed_batch_from_args(args: tuple) -> dict:
+    """Worker entry point: generate and compact an entire batch in the worker."""
+    sample_args = args
+    return pack_samples([make_sample_from_args(item) for item in sample_args])
+
+
+def move_packed_batch(batch: dict, device: torch.device) -> dict:
+    if device.type == "cuda":
+        batch = {key: (value.pin_memory() if hasattr(value, "pin_memory") else value) for key, value in batch.items()}
+    return {key: (value.to(device, non_blocking=True) if hasattr(value, "to") else value)
+            for key, value in batch.items()}
+
+
 def collate(samples: list[PairSample], device: torch.device) -> dict:
     def batch(name: str) -> Batch:
         return Batch.from_data_list([to_data(getattr(s, name)) for s in samples]).to(device)

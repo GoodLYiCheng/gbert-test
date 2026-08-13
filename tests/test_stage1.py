@@ -10,6 +10,7 @@ from topology_pretrain.graphs import (OOD_FAMILIES, TRAIN_FAMILIES, edge_jaccard
 from topology_pretrain.model import TopologyEncoder
 from topology_pretrain.coverage import CoverageController
 from topology_pretrain.training import _family_schedule
+from topology_pretrain.dataset import pack_samples
 
 
 def test_rooted_generator_contract():
@@ -67,3 +68,10 @@ def test_direct_perturbation_preserves_rooted_contract():
     for target in (0.0, 0.2, 0.5, 0.9):
         changed, _, _ = perturb(rooted, target, np.random.default_rng(100 + int(target * 10)), attempts=256)
         assert valid_rooted(changed.graph, changed.root)
+
+
+def test_packed_batch_contains_four_graph_views():
+    samples = [make_sample(31, "train", i, "topology-v1", .02, 1) for i in range(2)]
+    packed = pack_samples(samples)
+    assert packed["size"] == 2
+    assert packed["graphs"].root_mask.sum().item() == 8
