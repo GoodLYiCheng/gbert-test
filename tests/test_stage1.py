@@ -60,3 +60,10 @@ def test_changed_edge_set_is_final_symmetric_difference():
     rooted = sample_rooted_graph(19, "test", 3)
     changed, _, delta = perturb(rooted, .5, np.random.default_rng(3), attempts=32)
     assert delta == edge_set(rooted.graph) ^ edge_set(changed.graph)
+
+
+def test_direct_perturbation_preserves_rooted_contract():
+    rooted = sample_rooted_graph(23, "test", 4)
+    for target in (0.0, 0.2, 0.5, 0.9):
+        changed, _, _ = perturb(rooted, target, np.random.default_rng(100 + int(target * 10)), attempts=256)
+        assert valid_rooted(changed.graph, changed.root)

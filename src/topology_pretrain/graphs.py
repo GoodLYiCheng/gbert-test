@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -150,32 +149,58 @@ def rooted_isomorphic(a: RootedGraph, b: RootedGraph) -> bool:
     return nx.is_isomorphic(ga, gb, node_match=lambda x, y: x["is_root"] == y["is_root"])
 
 
+def _protected_bfs_edges(g: nx.Graph, root: int) -> set[tuple[int, int]]:
+    """Edges whose retention proves rooted connectivity and the two-hop bound."""
+    tree = nx.bfs_tree(g, root, depth_limit=2)
+    return {tuple(sorted((int(u), int(v)))) for u, v in tree.edges()}
+
+
+def _edit_counts(edge_count: int, additions: int, deletions: int, target: float) -> tuple[int, int, float]:
+    """Choose legal add/delete counts minimizing Jaccard-distance error.
+
+    With fixed correspondence and no repeated toggle, d=(add+delete)/(E+add).
+    The search is over integer addition counts only; for each count the best
+    deletion count is one of the two integers around the analytic solution.
+    """
+    best = (0, 0, 0.0)
+    best_error = abs(target)
+    for add in range(additions + 1):
+        ideal = target * (edge_count + add) - add
+        for delete in {int(np.floor(ideal)), int(np.ceil(ideal)), 0, deletions}:
+            delete = min(deletions, max(0, delete))
+            distance = (add + delete) / (edge_count + add)
+            error = abs(distance - target)
+            if error < best_error:
+                best, best_error = (add, delete, distance), error
+    return best
+
+
 def perturb(rooted: RootedGraph, target: float, rng: np.random.Generator, tolerance: float = .02,
             attempts: int = 256) -> tuple[RootedGraph, float, set[tuple[int, int]]]:
-    base_edges = edge_set(rooted.graph); nodes = list(rooted.graph.nodes())
-    best: tuple[nx.Graph, float] | None = None
-    for _ in range(attempts):
-        g = rooted.graph.copy()
-        operations = int(rng.integers(1, max(2, len(nodes) * 2)))
-        for _ in range(operations):
-            u, v = rng.choice(nodes, size=2, replace=False)
-            u, v = int(u), int(v)
-            if g.has_edge(u, v):
-                g.remove_edge(u, v)
-            else:
-                g.add_edge(u, v)
-            if not valid_rooted(g, rooted.root):
-                if g.has_edge(u, v): g.remove_edge(u, v)
-                else: g.add_edge(u, v)
-        distance = edge_jaccard(rooted.graph, g)
-        if best is None or abs(distance - target) < abs(best[1] - target):
-            best = (g, distance)
-        if abs(distance - target) <= tolerance:
-            break
-    assert best is not None
-    out = RootedGraph(best[0], rooted.root, rooted.family, rooted.sample_id)
-    actual = 0.0 if rooted_isomorphic(rooted, out) else best[1]
-    return out, actual, base_edges ^ edge_set(out.graph)
+    """Construct one valid perturbation instead of trial-and-error candidates.
+
+    The BFS tree rooted at ``root`` is protected from deletion.  Therefore all
+    remaining nodes stay connected and at distance at most two without calling
+    an expensive graph check after every edit. ``attempts`` remains accepted for
+    backwards-compatible configs but is intentionally unused.
+    """
+    del tolerance, attempts
+    base_edges = edge_set(rooted.graph)
+    nodes = list(rooted.graph.nodes())
+    protected = _protected_bfs_edges(rooted.graph, rooted.root)
+    removable = tuple(base_edges - protected)
+    possible_additions = tuple((u, v) for index, u in enumerate(nodes) for v in nodes[index + 1:]
+                               if (u, v) not in base_edges)
+    add_count, delete_count, distance = _edit_counts(len(base_edges), len(possible_additions), len(removable), target)
+    added = {possible_additions[int(i)] for i in rng.choice(len(possible_additions), size=add_count, replace=False)} if add_count else set()
+    removed = {removable[int(i)] for i in rng.choice(len(removable), size=delete_count, replace=False)} if delete_count else set()
+    g = rooted.graph.copy()
+    g.remove_edges_from(removed); g.add_edges_from(added)
+    out = RootedGraph(g, rooted.root, rooted.family, rooted.sample_id)
+    # The direct construction is valid by the protected BFS tree invariant.
+    assert valid_rooted(out.graph, out.root)
+    actual = 0.0 if rooted_isomorphic(rooted, out) else distance
+    return out, actual, added | removed
 
 
 def to_data(rooted: RootedGraph) -> Data:

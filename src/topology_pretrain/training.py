@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import random
 from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from torch.nn import functional as F
 from tqdm import trange
 
 from .coverage import CoverageController
-from .dataset import collate, make_sample
+from .dataset import collate, make_sample, make_sample_from_args
 from .graphs import OOD_FAMILIES, TRAIN_FAMILIES
 from .model import StatHead, TopologyEncoder
 
@@ -42,8 +43,9 @@ def evaluate(model, head, config: dict, split: str, size: int, ood: bool = False
     device = next(model.parameters()).device; model.eval(); head.eval()
     predictions: list[float] = []; targets: list[float] = []; ranks: list[bool] = []; isos: list[float] = []; losses: list[float] = []
     batch_size = int(config["batch_size"])
+    fixed_samples = _fixed_samples(config, split, size, OOD_FAMILIES if ood else None)
     for start in range(0, size, batch_size):
-        samples = [make_sample(config["seed"], split, start + i, config["generator_version"], config["perturb_tolerance"], config["perturb_attempts"], OOD_FAMILIES if ood else None) for i in range(min(batch_size, size - start))]
+        samples = fixed_samples[start:start + batch_size]
         b = collate(samples, device); loss, _ = _loss(model, head, b, config["ranking_margin"], config["lambda_rank"], config["lambda_stat"])
         z0, zi, za, zb = model(b["anchor"]), model(b["iso"]), model(b["a"]), model(b["b"])
         ca, cb = F.cosine_similarity(z0, za), F.cosine_similarity(z0, zb)
@@ -74,6 +76,50 @@ def _family_schedule(coverage: CoverageController) -> tuple[str, ...]:
     return tuple(tickets)
 
 
+class _ImmediateFuture:
+    def __init__(self, value) -> None:
+        self.value = value
+
+    def result(self):
+        return self.value
+
+
+class SamplePrefetcher:
+    """Overlap deterministic CPU graph generation with GPU optimization."""
+
+    def __init__(self, config: dict) -> None:
+        self.config = config
+        self.workers = int(config.get("data_workers", 0))
+        self.depth = max(1, int(config.get("prefetch_batches", 1)))
+        self.pool = ProcessPoolExecutor(max_workers=self.workers) if self.workers > 0 else None
+        self.pending: dict[int, Future] = {}
+
+    def submit(self, sample_id: int, split: str, families) -> None:
+        if sample_id in self.pending:
+            return
+        args = (self.config["seed"], split, sample_id, self.config["generator_version"],
+                self.config["perturb_tolerance"], self.config["perturb_attempts"], families)
+        self.pending[sample_id] = self.pool.submit(make_sample_from_args, args) if self.pool else _ImmediateFuture(make_sample(*args))
+
+    def take(self, sample_id: int):
+        return self.pending.pop(sample_id).result()
+
+    def close(self) -> None:
+        if self.pool:
+            self.pool.shutdown(wait=True, cancel_futures=True)
+
+
+def _fixed_samples(config: dict, split: str, size: int, families=None):
+    """Parallel deterministic fixed-set generation for validation and test."""
+    args = [(config["seed"], split, i, config["generator_version"], config["perturb_tolerance"],
+             config["perturb_attempts"], families) for i in range(size)]
+    workers = int(config.get("data_workers", 0))
+    if workers <= 0:
+        return [make_sample_from_args(item) for item in args]
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(make_sample_from_args, args, chunksize=8))
+
+
 def train(config: dict, run_dir: Path) -> dict:
     run_dir.mkdir(parents=True, exist_ok=True); device = _device(config["device"])
     random.seed(config["seed"]); np.random.seed(config["seed"]); torch.manual_seed(config["seed"])
@@ -83,29 +129,39 @@ def train(config: dict, run_dir: Path) -> dict:
     batches = range(0, int(config["max_anchors"]), int(config["batch_size"])); iterator = batches if config.get("no_progress") else trange(0, int(config["max_anchors"]), int(config["batch_size"]), desc="anchors")
     schedule: tuple[str, ...] = TRAIN_FAMILIES
     schedule_block = -1
-    for start in iterator:
-        block = start // config["coverage_update_every"]
-        if block != schedule_block:
-            schedule_block = block
-            schedule = _family_schedule(coverage)
-            (run_dir / "coverage_schedule.jsonl").open("a", encoding="utf-8").write(json.dumps({"start": start, "families": schedule}) + "\n")
-        samples = [make_sample(config["seed"], "train", start + i, config["generator_version"], config["perturb_tolerance"], config["perturb_attempts"], schedule) for i in range(min(config["batch_size"], config["max_anchors"] - start))]
-        batch = collate(samples, device); model.train(); head.train(); optimizer.zero_grad()
-        loss, parts = _loss(model, head, batch, config["ranking_margin"], config["lambda_rank"], config["lambda_stat"]); loss.backward()
-        torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(head.parameters()), config["grad_clip"]); optimizer.step()
-        for s in samples: coverage.add(s.desc)
-        consumed = start + len(samples)
-        if not config.get("no_progress"): iterator.set_postfix(loss=f"{loss.item():.4f}", sim=f"{parts['sim']:.4f}")
-        if consumed % config["eval_every"] < len(samples):
-            metrics = evaluate(model, head, config, "validation", config["val_size"]); metrics["consumed_anchors"] = consumed
-            history.append(metrics)
-            (run_dir / "validation_history.jsonl").open("a", encoding="utf-8").write(json.dumps(metrics) + "\n")
-            if metrics["spearman"] > best["spearman"]:
-                best = metrics; _save(run_dir / "best.pt", model, head, optimizer, config, consumed, coverage, best)
-            stable = len(history) == history.maxlen and max(x["spearman"] for x in history) - min(x["spearman"] for x in history) < config["stability_delta"] and max(x["ranking_accuracy"] for x in history) - min(x["ranking_accuracy"] for x in history) < config["stability_delta"]
-            coverage_ok = all(min(values["counts"].values()) >= config["coverage_min_count"] and values["js_divergence"] < config["coverage_js_threshold"] for values in coverage.summary().values())
-            if consumed >= config["min_anchors"] and stable and coverage_ok: break
-        if consumed % config["checkpoint_every"] < len(samples): _save(run_dir / "last.pt", model, head, optimizer, config, consumed, coverage, best)
+    prefetcher = SamplePrefetcher(config)
+    try:
+        for start in iterator:
+            block = start // config["coverage_update_every"]
+            if block != schedule_block:
+                schedule_block = block
+                schedule = _family_schedule(coverage)
+                (run_dir / "coverage_schedule.jsonl").open("a", encoding="utf-8").write(json.dumps({"start": start, "families": schedule}) + "\n")
+            # Submit individual samples several batches ahead. This gives CPU
+            # workers enough work while the main process is executing the GNN.
+            prefetch_end = min(config["max_anchors"], start + config["batch_size"] * prefetcher.depth)
+            for sample_id in range(start, prefetch_end):
+                prefetcher.submit(sample_id, "train", schedule)
+            current_end = min(config["max_anchors"], start + config["batch_size"])
+            samples = [prefetcher.take(sample_id) for sample_id in range(start, current_end)]
+            batch = collate(samples, device); model.train(); head.train(); optimizer.zero_grad()
+            loss, parts = _loss(model, head, batch, config["ranking_margin"], config["lambda_rank"], config["lambda_stat"]); loss.backward()
+            torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(head.parameters()), config["grad_clip"]); optimizer.step()
+            for s in samples: coverage.add(s.desc)
+            consumed = start + len(samples)
+            if not config.get("no_progress"): iterator.set_postfix(loss=f"{loss.item():.4f}", sim=f"{parts['sim']:.4f}")
+            if consumed % config["eval_every"] < len(samples):
+                metrics = evaluate(model, head, config, "validation", config["val_size"]); metrics["consumed_anchors"] = consumed
+                history.append(metrics)
+                (run_dir / "validation_history.jsonl").open("a", encoding="utf-8").write(json.dumps(metrics) + "\n")
+                if metrics["spearman"] > best["spearman"]:
+                    best = metrics; _save(run_dir / "best.pt", model, head, optimizer, config, consumed, coverage, best)
+                stable = len(history) == history.maxlen and max(x["spearman"] for x in history) - min(x["spearman"] for x in history) < config["stability_delta"] and max(x["ranking_accuracy"] for x in history) - min(x["ranking_accuracy"] for x in history) < config["stability_delta"]
+                coverage_ok = all(min(values["counts"].values()) >= config["coverage_min_count"] and values["js_divergence"] < config["coverage_js_threshold"] for values in coverage.summary().values())
+                if consumed >= config["min_anchors"] and stable and coverage_ok: break
+            if consumed % config["checkpoint_every"] < len(samples): _save(run_dir / "last.pt", model, head, optimizer, config, consumed, coverage, best)
+    finally:
+        prefetcher.close()
     _save(run_dir / "last.pt", model, head, optimizer, config, consumed, coverage, best)
     (run_dir / "coverage.json").write_text(json.dumps(coverage.summary(), indent=2), encoding="utf-8")
     return {"best": best, "consumed_anchors": consumed, "device": str(device)}

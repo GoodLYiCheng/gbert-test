@@ -36,6 +36,11 @@ def make_sample(seed: int, split: str, sample_id: int, version: str, tolerance: 
     return PairSample(anchor, iso, a, b, d_a, d_b, stats(anchor), descriptors(anchor))
 
 
+def make_sample_from_args(args: tuple) -> PairSample:
+    """Pickle-friendly entry point for ProcessPoolExecutor workers."""
+    return make_sample(*args)
+
+
 def collate(samples: list[PairSample], device: torch.device) -> dict:
     def batch(name: str) -> Batch:
         return Batch.from_data_list([to_data(getattr(s, name)) for s in samples]).to(device)
