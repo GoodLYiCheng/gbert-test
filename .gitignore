@@ -1,0 +1,19 @@
+# Python build and test artefacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+
+# Experiment outputs and large model checkpoints
+artifacts/
+*.pt
+*.pth
+*.ckpt
+
+# Local environments and editor files
+.venv/
+venv/
+.vscode/
+.idea/

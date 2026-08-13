@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "topology-pretrain"
+version = "0.1.0"
+description = "Dataset-independent rooted topology pretraining"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Topology Pretraining Contributors"}]
+keywords = ["graph", "gnn", "gin", "topology", "pretraining", "pytorch-geometric"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.23,<2.0",
+    "scipy>=1.10,<2.0",
+    "networkx>=3.1,<4.0",
+    "PyYAML>=6.0,<7.0",
+    "tqdm>=4.65,<5.0",
+    "torch>=1.13,<2.1",
+    "torch-geometric>=2.5,<2.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0,<9.0"]
+
+[project.scripts]
+topology-pretrain = "topology_pretrain.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
