@@ -12,10 +12,10 @@ weight_decay: 0.0001
 grad_clip: 1.0
 max_anchors: 10000000
 min_anchors: 2000000
-eval_every: 100000
+eval_every: 500000
 checkpoint_every: 100000
 # Fixed model-selection set, built once before training and reused at each eval.
-val_size: 5000
+val_size: 1024
 cache_validation: true
 id_test_size: 50000
 ood_test_size: 50000

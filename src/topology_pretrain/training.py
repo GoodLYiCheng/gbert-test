@@ -188,7 +188,11 @@ def train(config: dict, run_dir: Path) -> dict:
                                      cpu_wait=f"{timing['wait_seconds']/timing['batches']:.3f}s",
                                      gpu=f"{timing['gpu_seconds']/timing['batches']:.3f}s")
             if consumed % config["eval_every"] < batch["size"]:
+                print(f"\nValidation start: anchors={consumed}, cached_samples={config['val_size']}", flush=True)
+                validation_start = time.perf_counter()
                 metrics = evaluate(model, head, config, "validation", config["val_size"], cached_batches=validation_batches); metrics["consumed_anchors"] = consumed
+                print(f"Validation complete in {time.perf_counter() - validation_start:.1f}s: "
+                      f"spearman={metrics['spearman']:.4f}, ranking={metrics['ranking_accuracy']:.4f}", flush=True)
                 history.append(metrics)
                 (run_dir / "validation_history.jsonl").open("a", encoding="utf-8").write(json.dumps(metrics) + "\n")
                 if metrics["spearman"] > best["spearman"]:
@@ -196,7 +200,11 @@ def train(config: dict, run_dir: Path) -> dict:
                 stable = len(history) == history.maxlen and max(x["spearman"] for x in history) - min(x["spearman"] for x in history) < config["stability_delta"] and max(x["ranking_accuracy"] for x in history) - min(x["ranking_accuracy"] for x in history) < config["stability_delta"]
                 coverage_ok = all(min(values["counts"].values()) >= config["coverage_min_count"] and values["js_divergence"] < config["coverage_js_threshold"] for values in coverage.summary().values())
                 if consumed >= config["min_anchors"] and stable and coverage_ok: break
-            if consumed % config["checkpoint_every"] < batch["size"]: _save(run_dir / "last.pt", model, head, optimizer, config, consumed, coverage, best)
+            if consumed % config["checkpoint_every"] < batch["size"]:
+                print(f"Checkpoint start: anchors={consumed}", flush=True)
+                checkpoint_start = time.perf_counter()
+                _save(run_dir / "last.pt", model, head, optimizer, config, consumed, coverage, best)
+                print(f"Checkpoint complete in {time.perf_counter() - checkpoint_start:.1f}s", flush=True)
     finally:
         prefetcher.close()
     _save(run_dir / "last.pt", model, head, optimizer, config, consumed, coverage, best)

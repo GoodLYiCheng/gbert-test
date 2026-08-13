@@ -48,7 +48,7 @@ size to 256. Each run writes `throughput.json`: increase workers/prefetch if
 `mean_cpu_wait_seconds` exceeds `mean_gpu_step_seconds`; increase batch size if
 GPU utilisation is still low after CPU wait is comparable to GPU step time.
 
-The training validation set is a fixed, cached 5,000-anchor model-selection
+The training validation set is a fixed, cached 1,024-anchor model-selection
 set. It is generated once before CUDA training starts, so an evaluation at 1%
 does not create a second CPU worker pool or stall the GPU. The 50,000-anchor
 ID/OOD sets remain reserved for the final `evaluate` command.
