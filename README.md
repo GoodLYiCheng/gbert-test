@@ -57,3 +57,35 @@ The training validation set is a fixed, cached 1,024-anchor model-selection
 set. It is generated once before CUDA training starts, so an evaluation at 1%
 does not create a second CPU worker pool or stall the GPU. The 50,000-anchor
 ID/OOD sets remain reserved for the final `evaluate` command.
+
+## Stage 2: frozen Qwen3-8B QA alignment
+
+Stage 2 converts the frozen 128-dimensional Stage 1 root embedding into four
+continuous Qwen3-8B GraphTokens. Qwen and the topology encoder remain frozen;
+only the FP32 two-layer Projector is trained. The MVP covers node count, edge
+count, root degree/one-hop count, and two-hop count with English integer-answer
+prompts.
+
+Install `transformers>=4.51` for Qwen3 support, then edit
+`configs/stage2_qwen3_8b_qa.yaml` so `stage1_run_dir` points to the completed
+formal Stage 1 run on Linux. The directory must contain `topology_encoder.pt`,
+`run_manifest.json`, `metrics.json`, and `report.md`.
+
+```bash
+topology-pretrain stage2-prepare --config configs/stage2_qwen3_8b_qa.yaml
+topology-pretrain stage2-train --config configs/stage2_qwen3_8b_qa.yaml
+topology-pretrain stage2-evaluate --run-dir artifacts/stage2_<timestamp>
+topology-pretrain stage2-export --run-dir artifacts/stage2_<timestamp>
+```
+
+The formal profile targets one A100 with native BF16 and SDPA. Preparation
+writes fixed, split-isolated embedding caches. Training writes a resumable
+`last.pt` and `best_projector.safetensors`. Evaluation records paired predictions
+for normal, zero, random, shuffled, and text-only GraphToken conditions, followed
+by 10,000-sample paired bootstrap confidence intervals. A run that misses any
+acceptance threshold remains `UNVERIFIED`; it never unfreezes Stage 1 or Qwen.
+
+For interface-only development, `allow_smoke_artifact: true` permits a local
+smoke export without formal Stage 1 evidence. Every resulting cache and run is
+permanently marked `engineering_only` and must not be reported as a scientific
+Stage 2 result.
