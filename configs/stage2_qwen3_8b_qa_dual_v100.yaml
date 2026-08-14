@@ -5,7 +5,7 @@ generator_version: topology-v1
 hardware_profile: dual_v100
 device: cuda:0
 output_dir: artifacts
-stage1_run_dir: /home/xiewt24/liuyc/gbert-test/artifacts/stagel
+stage1_run_dir: /home/xiewt24/liuyc/gbert-test/artifacts/stage1
 allow_smoke_artifact: false
 no_progress: false
 
