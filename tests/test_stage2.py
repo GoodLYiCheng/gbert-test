@@ -33,6 +33,7 @@ from topology_pretrain.stage2_model import (
 from topology_pretrain.stage2_training import (
     _device_and_dtype,
     _majority_baselines,
+    _qwen_load_source,
     _shuffle_map,
     _validate_dual_gpu_device_map,
     assert_frozen_training_contract,
@@ -194,6 +195,29 @@ def test_dual_gpu_device_map_rejects_offload_and_requires_both_gpus():
         )
     with pytest.raises(RuntimeError, match="must use both"):
         _validate_dual_gpu_device_map(SimpleNamespace(hf_device_map={"": 0}))
+
+
+def test_qwen_local_source_is_offline_and_keeps_pinned_identity(tmp_path):
+    local_model = tmp_path / "Qwen3-8B"
+    local_model.mkdir()
+    (local_model / "config.json").write_text("{}", encoding="utf-8")
+    source, kwargs = _qwen_load_source(
+        {
+            "model_id": "Qwen/Qwen3-8B",
+            "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+            "local_path": str(local_model),
+        }
+    )
+    assert source == str(local_model.resolve())
+    assert kwargs == {"local_files_only": True}
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        _qwen_load_source(
+            {
+                "model_id": "Qwen/Qwen3-8B",
+                "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+                "local_path": str(tmp_path / "missing"),
+            }
+        )
 
 
 def test_stage1_smoke_requires_explicit_engineering_override():

@@ -100,6 +100,12 @@ and the first optimizer step verifies that a finite, nonzero gradient crossed
 the frozen sharded LLM back into the GraphTokens. A device map containing CPU,
 disk, or only one GPU is rejected.
 
+For an offline model copy, keep `model_id: Qwen/Qwen3-8B` and set
+`llm.local_path` to the directory containing its `config.json`, tokenizer
+files, and weight shards. Both tokenizer and model loading then use
+`local_files_only=True`; no Hub connection is attempted. The pinned model ID
+and revision remain in the run provenance.
+
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1
 topology-pretrain stage2-prepare --config configs/stage2_qwen3_8b_qa_dual_v100.yaml

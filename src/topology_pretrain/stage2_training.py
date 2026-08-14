@@ -96,6 +96,23 @@ def _projector_device(llm, fallback: torch.device) -> torch.device:
     return device if device.type != "meta" else fallback
 
 
+def _qwen_load_source(llm_config: dict) -> tuple[str, dict]:
+    """Resolve a pinned Hub model or an explicitly supplied offline copy."""
+    model_id = str(llm_config.get("model_id", QWEN_MODEL_ID))
+    revision = str(llm_config.get("revision", QWEN_REVISION))
+    if model_id != QWEN_MODEL_ID or revision != QWEN_REVISION:
+        raise ValueError("Formal Stage 2 protocol pins Qwen/Qwen3-8B and its approved revision")
+    local_path = llm_config.get("local_path")
+    if local_path in {None, ""}:
+        return model_id, {"revision": revision}
+    path = Path(str(local_path)).expanduser()
+    if not path.is_dir():
+        raise FileNotFoundError(f"Configured local Qwen directory does not exist: {path}")
+    if not (path / "config.json").is_file():
+        raise FileNotFoundError(f"Local Qwen directory is missing config.json: {path}")
+    return str(path.resolve()), {"local_files_only": True}
+
+
 def load_frozen_qwen(config: dict, device: torch.device, dtype: torch.dtype):
     try:
         import transformers
@@ -106,15 +123,12 @@ def load_frozen_qwen(config: dict, device: torch.device, dtype: torch.dtype):
     if Version(transformers.__version__) < Version("4.51.0"):
         raise RuntimeError(f"Qwen3 requires transformers>=4.51.0; found {transformers.__version__}")
     llm_config = config["llm"]
-    model_id = str(llm_config.get("model_id", QWEN_MODEL_ID))
-    revision = str(llm_config.get("revision", QWEN_REVISION))
-    if model_id != QWEN_MODEL_ID or revision != QWEN_REVISION:
-        raise ValueError("Formal Stage 2 protocol pins Qwen/Qwen3-8B and its approved revision")
-    tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision, use_fast=True)
+    model_source, source_kwargs = _qwen_load_source(llm_config)
+    tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True, **source_kwargs)
     load_kwargs = {
-        "revision": revision,
         "torch_dtype": dtype,
         "attn_implementation": str(llm_config.get("attn_implementation", "sdpa")),
+        **source_kwargs,
     }
     if str(config.get("hardware_profile", "a100_single")) == "dual_v100":
         max_memory = llm_config.get("max_memory", {0: "28GiB", 1: "30GiB"})
@@ -123,10 +137,10 @@ def load_frozen_qwen(config: dict, device: torch.device, dtype: torch.dtype):
             max_memory={int(key): str(value) for key, value in max_memory.items()},
             low_cpu_mem_usage=True,
         )
-        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+        model = AutoModelForCausalLM.from_pretrained(model_source, **load_kwargs)
         _validate_dual_gpu_device_map(model)
     else:
-        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs).to(device)
+        model = AutoModelForCausalLM.from_pretrained(model_source, **load_kwargs).to(device)
     if int(model.config.hidden_size) != 4096 or int(model.config.num_hidden_layers) != 36:
         raise ValueError("Loaded model is not the pinned Qwen3-8B architecture")
     freeze_module(model)

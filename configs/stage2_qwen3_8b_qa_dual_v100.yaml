@@ -5,7 +5,7 @@ generator_version: topology-v1
 hardware_profile: dual_v100
 device: cuda:0
 output_dir: artifacts
-stage1_run_dir: /absolute/path/to/formal/stage1_run
+stage1_run_dir: /home/xiewt24/liuyc/gbert-test/artifacts/stagel
 allow_smoke_artifact: false
 no_progress: false
 
@@ -19,6 +19,7 @@ data:
 
 llm:
   model_id: Qwen/Qwen3-8B
+  local_path: /data/Qwen/Qwen3-8B/Qwen3-8B
   revision: b968826d9c46dd6066d109eabc6255188de91218
   dtype: float16
   attn_implementation: sdpa
