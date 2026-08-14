@@ -45,16 +45,55 @@ def _load_data_manifest(config: dict) -> tuple[Path, dict]:
 
 
 def _device_and_dtype(config: dict) -> tuple[torch.device, torch.dtype]:
-    requested = str(config.get("device", "cuda"))
-    if requested == "cuda" and not torch.cuda.is_available():
+    profile = str(config.get("hardware_profile", "a100_single"))
+    if profile not in {"a100_single", "dual_v100"}:
+        raise ValueError(f"Unsupported Stage 2 hardware_profile: {profile}")
+    requested = str(config.get("device", "cuda:0"))
+    if torch.device(requested).type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("Stage 2 Qwen3-8B training requires CUDA")
     device = torch.device(requested)
     dtype_name = str(config["llm"].get("dtype", "bfloat16"))
-    if dtype_name != "bfloat16":
-        raise ValueError("The formal A100 baseline requires llm.dtype=bfloat16")
-    if device.type == "cuda" and not torch.cuda.is_bf16_supported():
-        raise RuntimeError("Configured CUDA device does not support native BF16")
-    return device, torch.bfloat16
+    if profile == "a100_single":
+        if dtype_name != "bfloat16":
+            raise ValueError("The single-A100 profile requires llm.dtype=bfloat16")
+        if device.type == "cuda" and not torch.cuda.is_bf16_supported():
+            raise RuntimeError("Configured CUDA device does not support native BF16")
+        return device, torch.bfloat16
+    if device.type != "cuda" or device.index not in {None, 0}:
+        raise ValueError("The dual-V100 profile must start on visible CUDA device 0")
+    if dtype_name != "float16":
+        raise ValueError("The dual-V100 profile requires llm.dtype=float16")
+    if torch.cuda.device_count() != 2:
+        raise RuntimeError(
+            "The dual-V100 profile requires exactly two visible GPUs; set CUDA_VISIBLE_DEVICES to the chosen pair"
+        )
+    return torch.device("cuda:0"), torch.float16
+
+
+def _normalise_device(value: object) -> str:
+    if isinstance(value, int):
+        return f"cuda:{value}"
+    text = str(value)
+    return f"cuda:{text}" if text.isdigit() else text
+
+
+def _validate_dual_gpu_device_map(model) -> dict[str, str]:
+    raw = getattr(model, "hf_device_map", None)
+    if not isinstance(raw, dict) or not raw:
+        raise RuntimeError("Dual-V100 loading did not produce an hf_device_map")
+    normalised = {str(name): _normalise_device(value) for name, value in raw.items()}
+    devices = set(normalised.values())
+    forbidden = devices - {"cuda:0", "cuda:1"}
+    if forbidden:
+        raise RuntimeError(f"CPU/disk/off-profile Qwen placement is forbidden: {sorted(forbidden)}")
+    if devices != {"cuda:0", "cuda:1"}:
+        raise RuntimeError(f"Qwen must use both visible V100 GPUs; observed {sorted(devices)}")
+    return normalised
+
+
+def _projector_device(llm, fallback: torch.device) -> torch.device:
+    device = llm.get_input_embeddings().weight.device
+    return device if device.type != "meta" else fallback
 
 
 def load_frozen_qwen(config: dict, device: torch.device, dtype: torch.dtype):
@@ -72,12 +111,22 @@ def load_frozen_qwen(config: dict, device: torch.device, dtype: torch.dtype):
     if model_id != QWEN_MODEL_ID or revision != QWEN_REVISION:
         raise ValueError("Formal Stage 2 protocol pins Qwen/Qwen3-8B and its approved revision")
     tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        revision=revision,
-        torch_dtype=dtype,
-        attn_implementation=str(llm_config.get("attn_implementation", "sdpa")),
-    ).to(device)
+    load_kwargs = {
+        "revision": revision,
+        "torch_dtype": dtype,
+        "attn_implementation": str(llm_config.get("attn_implementation", "sdpa")),
+    }
+    if str(config.get("hardware_profile", "a100_single")) == "dual_v100":
+        max_memory = llm_config.get("max_memory", {0: "28GiB", 1: "30GiB"})
+        load_kwargs.update(
+            device_map=str(llm_config.get("device_map", "balanced")),
+            max_memory={int(key): str(value) for key, value in max_memory.items()},
+            low_cpu_mem_usage=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+        _validate_dual_gpu_device_map(model)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs).to(device)
     if int(model.config.hidden_size) != 4096 or int(model.config.num_hidden_layers) != 36:
         raise ValueError("Loaded model is not the pinned Qwen3-8B architecture")
     freeze_module(model)
@@ -143,6 +192,13 @@ def _scheduler(optimizer, total_steps: int, warmup_ratio: float):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
 
+def _grad_scaler(enabled: bool):
+    """Use the current AMP API while retaining compatibility with older test hosts."""
+    if hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 def _save_projector(path: Path, projector: GraphProjector) -> None:
     from safetensors.torch import save_file
 
@@ -162,6 +218,7 @@ def _checkpoint(
     projector,
     optimizer,
     scheduler,
+    scaler,
     epoch: int,
     global_step: int,
     best: dict,
@@ -173,6 +230,7 @@ def _checkpoint(
             "projector": projector.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
             "epoch": epoch,
             "global_step": global_step,
             "best": best,
@@ -187,13 +245,15 @@ def _checkpoint(
     )
 
 
-def _restore(path: Path, projector, optimizer, scheduler, expected_hash: str, device: torch.device) -> tuple[int, int, dict]:
+def _restore(path: Path, projector, optimizer, scheduler, scaler, expected_hash: str, device: torch.device) -> tuple[int, int, dict]:
     state = torch.load(path, map_location=device, weights_only=False)
     if state["data_manifest_sha256"] != expected_hash:
         raise ValueError("Resume checkpoint uses a different Stage 2 data manifest")
     projector.load_state_dict(state["projector"])
     optimizer.load_state_dict(state["optimizer"])
     scheduler.load_state_dict(state["scheduler"])
+    if state.get("scaler"):
+        scaler.load_state_dict(state["scaler"])
     torch.set_rng_state(state["torch_rng"])
     if device.type == "cuda" and state.get("cuda_rng") is not None:
         torch.cuda.set_rng_state_all(state["cuda_rng"])
@@ -439,18 +499,19 @@ def evaluate_stage2(
     device, dtype = _device_and_dtype(config)
     if tokenizer is None or llm is None:
         tokenizer, llm = load_frozen_qwen(config, device, dtype)
+    projector_device = _projector_device(llm, device)
     if projector is None:
         projector = make_projector(config, llm)
         _load_projector(run_dir / "best_projector.safetensors", projector)
-        projector.to(device)
+    projector.to(projector_device)
     train_arrays = load_stage2_split(Path(config["data"]["cache_dir"]), "train")
     test_arrays = load_stage2_split(Path(config["data"]["cache_dir"]), "test")
     test_dataset = Stage2QADataset(test_arrays, "test", int(config["seed"]))
     loader = _loader(test_dataset, config, False, int(config["seed"]))
     batch_size = int(config["training"].get("batch_size", 8))
-    graph_table = _project_table(projector, test_arrays["embeddings"], device, batch_size)
+    graph_table = _project_table(projector, test_arrays["embeddings"], projector_device, batch_size)
     shuffle_indices = _shuffle_map(test_arrays)
-    random_stats = _fit_random_stats(projector, train_arrays["embeddings"], device, batch_size)
+    random_stats = _fit_random_stats(projector, train_arrays["embeddings"], projector_device, batch_size)
     records_by_condition = {}
     predictions_path = run_dir / "predictions.jsonl"
     with predictions_path.open("w", encoding="utf-8") as handle:
@@ -461,9 +522,9 @@ def evaluate_stage2(
                 tokenizer=tokenizer,
                 loader=loader,
                 config=config,
-                device=device,
+                device=projector_device,
                 condition=condition,
-                graph_token_table=graph_table.to(device) if condition == "shuffle" else None,
+                graph_token_table=graph_table.to(projector_device) if condition == "shuffle" else None,
                 shuffle_indices=shuffle_indices if condition == "shuffle" else None,
                 random_stats=random_stats if condition == "random" else None,
             )
@@ -526,7 +587,8 @@ def train_stage2(config: dict, run_dir: Path, *, tokenizer=None, llm=None) -> di
     else:
         freeze_module(llm)
         llm.config.use_cache = False
-    projector = make_projector(config, llm).to(device=device, dtype=torch.float32)
+    projector_device = _projector_device(llm, device)
+    projector = make_projector(config, llm).to(device=projector_device, dtype=torch.float32)
     training = config["training"]
     optimizer = torch.optim.AdamW(
         projector.parameters(),
@@ -541,12 +603,13 @@ def train_stage2(config: dict, run_dir: Path, *, tokenizer=None, llm=None) -> di
     accumulation = int(training.get("gradient_accumulation_steps", 4))
     updates_per_epoch = math.ceil(math.ceil(len(train_dataset) / int(training.get("batch_size", 8))) / accumulation)
     scheduler = _scheduler(optimizer, updates_per_epoch * epochs, float(training.get("warmup_ratio", 0.05)))
+    scaler = _grad_scaler(enabled=dtype == torch.float16 and projector_device.type == "cuda")
     assert_frozen_training_contract(projector, llm, optimizer)
     start_epoch, global_step, best = 0, 0, {"macro_numeric_accuracy": -1.0, "epoch": -1}
     resume = training.get("resume_from")
     if resume:
         start_epoch, global_step, best = _restore(
-            Path(resume), projector, optimizer, scheduler, manifest_hash, device
+            Path(resume), projector, optimizer, scheduler, scaler, manifest_hash, projector_device
         )
         _save_projector(run_dir / "best_projector.safetensors", projector)
     history_path = run_dir / "validation_history.jsonl"
@@ -559,7 +622,7 @@ def train_stage2(config: dict, run_dir: Path, *, tokenizer=None, llm=None) -> di
         rms_rows = []
         iterator = loader if config.get("no_progress", False) else tqdm(loader, desc=f"Stage 2 epoch {epoch + 1}/{epochs}")
         for batch_index, batch in enumerate(iterator):
-            topology = batch["embedding"].to(device, non_blocking=True)
+            topology = batch["embedding"].to(projector_device, non_blocking=True)
             graph_tokens = projector(topology)
             injected = build_injected_batch(
                 tokenizer=tokenizer,
@@ -580,20 +643,24 @@ def train_stage2(config: dict, run_dir: Path, *, tokenizer=None, llm=None) -> di
             loss = outputs.loss / accumulation
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite Stage 2 loss at epoch={epoch}, batch={batch_index}")
-            loss.backward()
+            scaler.scale(loss).backward()
             total_loss += float(loss.detach()) * accumulation
             rms_rows.append((injected.graph_token_rms, injected.text_token_rms))
             should_step = (batch_index + 1) % accumulation == 0 or batch_index + 1 == len(loader)
             if should_step:
+                scaler.unscale_(optimizer)
                 gradients = [parameter.grad for parameter in projector.parameters() if parameter.grad is not None]
                 if not gradients or not all(torch.isfinite(gradient).all() for gradient in gradients):
                     raise FloatingPointError("Projector gradients are missing or non-finite")
                 if not any(bool(torch.count_nonzero(gradient)) for gradient in gradients):
-                    raise RuntimeError("Projector gradient is identically zero")
+                    raise RuntimeError(
+                        "Projector gradient is identically zero; the sharded LLM may have broken the GraphToken gradient path"
+                    )
                 if any(parameter.grad is not None for parameter in llm.parameters()):
                     raise RuntimeError("Frozen Qwen parameter unexpectedly received a gradient")
                 torch.nn.utils.clip_grad_norm_(projector.parameters(), float(training.get("grad_clip", 1.0)))
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
@@ -607,7 +674,7 @@ def train_stage2(config: dict, run_dir: Path, *, tokenizer=None, llm=None) -> di
             tokenizer=tokenizer,
             loader=validation_loader,
             config=config,
-            device=device,
+            device=projector_device,
         )
         validation_metrics = _condition_metrics(validation_records)
         validation_metrics.update(
@@ -629,6 +696,7 @@ def train_stage2(config: dict, run_dir: Path, *, tokenizer=None, llm=None) -> di
             projector=projector,
             optimizer=optimizer,
             scheduler=scheduler,
+            scaler=scaler,
             epoch=epoch,
             global_step=global_step,
             best=best,
@@ -639,6 +707,13 @@ def train_stage2(config: dict, run_dir: Path, *, tokenizer=None, llm=None) -> di
         "best_validation": best,
         "global_step": global_step,
         "engineering_only": data_manifest["engineering_only"],
+        "hardware_profile": str(config.get("hardware_profile", "a100_single")),
+        "projector_device": str(projector_device),
+        "llm_device_map": (
+            _validate_dual_gpu_device_map(llm)
+            if str(config.get("hardware_profile", "a100_single")) == "dual_v100"
+            else {"": str(device)}
+        ),
         "run_dir": str(run_dir.resolve()),
     }
 
@@ -662,6 +737,7 @@ def export_stage2(run_dir: Path) -> dict:
         "llm_model_id": QWEN_MODEL_ID,
         "llm_revision": QWEN_REVISION,
         "llm_mode": "non-thinking",
+        "training_hardware_profile": str(config.get("hardware_profile", "a100_single")),
         "prompt_protocol": data_manifest["prompt_bank_version"],
         "stage1_export_sha256": data_manifest["stage1"]["export_sha256"],
         "data_manifest_sha256": sha256_file(run_dir / "data_manifest.json"),

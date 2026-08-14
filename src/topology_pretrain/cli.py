@@ -46,6 +46,11 @@ def main() -> None:
                     "torch": torch.__version__,
                     "cuda": torch.version.cuda,
                     "device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+                    "visible_cuda_devices": (
+                        [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())]
+                        if torch.cuda.is_available()
+                        else []
+                    ),
                 },
             }
             (run_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

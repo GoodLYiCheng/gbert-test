@@ -78,7 +78,7 @@ topology-pretrain stage2-evaluate --run-dir artifacts/stage2_<timestamp>
 topology-pretrain stage2-export --run-dir artifacts/stage2_<timestamp>
 ```
 
-The formal profile targets one A100 with native BF16 and SDPA. Preparation
+The default formal profile targets one A100 with native BF16 and SDPA. Preparation
 writes fixed, split-isolated embedding caches. Training writes a resumable
 `last.pt` and `best_projector.safetensors`. Evaluation records paired predictions
 for normal, zero, random, shuffled, and text-only GraphToken conditions, followed
@@ -89,3 +89,26 @@ For interface-only development, `allow_smoke_artifact: true` permits a local
 smoke export without formal Stage 1 evidence. Every resulting cache and run is
 permanently marked `engineering_only` and must not be reported as a scientific
 Stage 2 result.
+
+### Dual V100 execution
+
+`configs/stage2_qwen3_8b_qa_dual_v100.yaml` runs Qwen3-8B in FP16 with its
+layers balanced across exactly two visible V100s. It is one Python process with
+naive model parallelism, not DDP, so do not use `torchrun`. The Projector stays
+FP32 on the GPU that owns Qwen's input embedding. FP16 loss scaling is enabled,
+and the first optimizer step verifies that a finite, nonzero gradient crossed
+the frozen sharded LLM back into the GraphTokens. A device map containing CPU,
+disk, or only one GPU is rejected.
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+topology-pretrain stage2-prepare --config configs/stage2_qwen3_8b_qa_dual_v100.yaml
+topology-pretrain stage2-train --config configs/stage2_qwen3_8b_qa_dual_v100.yaml
+topology-pretrain stage2-evaluate --run-dir artifacts/stage2_<timestamp>
+topology-pretrain stage2-export --run-dir artifacts/stage2_<timestamp>
+```
+
+The V100 profile keeps the A100 optimization hyperparameters unchanged and
+does not quantize, checkpoint activations, or offload weights. Its default
+12/14 GiB device caps also support 16 GB V100s while leaving more headroom on
+GPU 0 for injected embeddings and Projector activations.

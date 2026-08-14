@@ -223,7 +223,7 @@ def greedy_generate_from_embeds(
     )
     batch_indices = torch.arange(batch.inputs_embeds.shape[0], device=batch.inputs_embeds.device)
     last_positions = batch.attention_mask.sum(dim=1) - 1
-    next_token = outputs.logits[batch_indices, last_positions].argmax(dim=-1)
+    next_token = outputs.logits[batch_indices, last_positions].argmax(dim=-1).to(batch.inputs_embeds.device)
     generated = [next_token]
     finished = next_token.eq(int(eos_token_id))
     past = outputs.past_key_values
@@ -246,7 +246,7 @@ def greedy_generate_from_embeds(
             use_cache=True,
             return_dict=True,
         )
-        next_token = step.logits[:, -1].argmax(dim=-1)
+        next_token = step.logits[:, -1].argmax(dim=-1).to(batch.inputs_embeds.device)
         next_token = torch.where(finished, torch.full_like(next_token, int(eos_token_id)), next_token)
         generated.append(next_token)
         finished |= next_token.eq(int(eos_token_id))

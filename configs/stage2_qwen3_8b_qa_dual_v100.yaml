@@ -1,8 +1,8 @@
-# Formal single-A100 Stage 2 QA MVP. Replace this with the completed remote
-# Stage 1 run containing the export, manifest, metrics, and report.
+# Dual-V100 Stage 2 QA profile. This is single-process layer-wise model
+# parallelism, so launch the ordinary CLI with exactly two visible GPUs.
 seed: 20260813
 generator_version: topology-v1
-hardware_profile: a100_single
+hardware_profile: dual_v100
 device: cuda:0
 output_dir: artifacts
 stage1_run_dir: /absolute/path/to/formal/stage1_run
@@ -14,17 +14,23 @@ data:
   train_graphs: 20000
   validation_graphs: 2000
   test_graphs: 5000
-  prepare_device: cuda
+  prepare_device: cuda:0
   embedding_batch_size: 256
 
 llm:
   model_id: Qwen/Qwen3-8B
   revision: b968826d9c46dd6066d109eabc6255188de91218
-  dtype: bfloat16
+  dtype: float16
   attn_implementation: sdpa
   enable_thinking: false
   max_input_length: 128
   max_new_tokens: 8
+  device_map: balanced
+  # Compatible with both 16 GB and 32 GB V100 variants. GPU 0 retains extra
+  # headroom for input embeddings, GraphTokens, outputs, and the Projector.
+  max_memory:
+    0: 12GiB
+    1: 14GiB
 
 projector:
   graph_dim: 128

@@ -9,6 +9,7 @@ tqdm>=4.65,<5.0
 torch>=2.6,<2.7
 torch-geometric>=2.6,<2.7
 transformers>=4.51,<5.0
+accelerate>=1.0,<2.0
 safetensors>=0.4,<1.0
 
 # Test-only dependency

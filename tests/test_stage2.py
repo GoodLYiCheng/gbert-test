@@ -31,8 +31,10 @@ from topology_pretrain.stage2_model import (
     prompt_token_ids,
 )
 from topology_pretrain.stage2_training import (
+    _device_and_dtype,
     _majority_baselines,
     _shuffle_map,
+    _validate_dual_gpu_device_map,
     assert_frozen_training_contract,
     train_stage2,
 )
@@ -163,6 +165,35 @@ def test_majority_label_is_selected_on_train_but_scored_on_test():
     baseline = _majority_baselines(train, test)["num_nodes"]
     assert baseline["label"] == 4
     assert baseline["accuracy"] == pytest.approx(1 / 3)
+
+
+def test_dual_v100_runtime_requires_fp16_and_exactly_two_visible_gpus(monkeypatch):
+    config = {
+        "hardware_profile": "dual_v100",
+        "device": "cuda:0",
+        "llm": {"dtype": "float16"},
+    }
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    device, dtype = _device_and_dtype(config)
+    assert device == torch.device("cuda:0") and dtype == torch.float16
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    with pytest.raises(RuntimeError, match="exactly two visible GPUs"):
+        _device_and_dtype(config)
+    config["llm"]["dtype"] = "bfloat16"
+    with pytest.raises(ValueError, match="requires llm.dtype=float16"):
+        _device_and_dtype(config)
+
+
+def test_dual_gpu_device_map_rejects_offload_and_requires_both_gpus():
+    valid = SimpleNamespace(hf_device_map={"model.embed_tokens": 0, "model.layers.20": "cuda:1"})
+    assert set(_validate_dual_gpu_device_map(valid).values()) == {"cuda:0", "cuda:1"}
+    with pytest.raises(RuntimeError, match="forbidden"):
+        _validate_dual_gpu_device_map(
+            SimpleNamespace(hf_device_map={"model.embed_tokens": 0, "model.layers.20": "cpu"})
+        )
+    with pytest.raises(RuntimeError, match="must use both"):
+        _validate_dual_gpu_device_map(SimpleNamespace(hf_device_map={"": 0}))
 
 
 def test_stage1_smoke_requires_explicit_engineering_override():
@@ -309,3 +340,4 @@ def test_tiny_stage2_training_writes_best_and_resumable_checkpoint(tmp_path):
     checkpoint = torch.load(run_dir / "last.pt", map_location="cpu", weights_only=False)
     assert checkpoint["epoch"] == 0 and checkpoint["global_step"] == 2
     assert checkpoint["optimizer"] and checkpoint["scheduler"]
+    assert "scaler" in checkpoint
