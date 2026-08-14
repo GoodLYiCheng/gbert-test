@@ -229,6 +229,25 @@ def test_stage1_smoke_requires_explicit_engineering_override():
     assert not any(parameter.requires_grad for parameter in encoder.parameters())
 
 
+def test_stage1_best_checkpoint_is_accepted_without_export(tmp_path):
+    run_dir = tmp_path / "stage1_best_only"
+    run_dir.mkdir()
+    source = __import__("pathlib").Path("artifacts/micro_smoke")
+    exported = torch.load(source / "topology_encoder.pt", map_location="cpu", weights_only=False)
+    torch.save(
+        {"encoder": exported["encoder"], "config": {"hidden_dim": 128}},
+        run_dir / "best.pt",
+    )
+    for name in ("metrics.json", "report.md"):
+        shutil.copy2(source / name, run_dir / name)
+    (run_dir / "run_manifest.json").write_text("{}", encoding="utf-8")
+    encoder, provenance = validate_stage1_artifact(run_dir)
+    assert provenance["artifact_type"] == "training_checkpoint"
+    assert provenance["artifact_path"].endswith("best.pt")
+    assert provenance["artifact_sha256"] == sha256_file(run_dir / "best.pt")
+    assert not any(parameter.requires_grad for parameter in encoder.parameters())
+
+
 def test_graph_slot_injection_masks_prompt_and_backpropagates_only_to_projector():
     tokenizer = CharacterTokenizer()
     llm = freeze_module(TinyCausalLM(max(tokenizer.id_to_char) + 2))

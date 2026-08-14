@@ -68,8 +68,14 @@ prompts.
 
 Install `transformers>=4.51` for Qwen3 support, then edit
 `configs/stage2_qwen3_8b_qa.yaml` so `stage1_run_dir` points to the completed
-formal Stage 1 run on Linux. The directory must contain `topology_encoder.pt`,
+formal Stage 1 run on Linux. The directory must contain an Encoder artifact plus
 `run_manifest.json`, `metrics.json`, and `report.md`.
+
+If Stage 1 has not been exported yet, Stage 2 also accepts this repository's
+`best.pt` training checkpoint in place of `topology_encoder.pt`. It extracts
+only the Encoder state, validates the same 128-dimensional two-layer SUM-GIN
+contract, and records the checkpoint hash in provenance. Formal runs still
+require `run_manifest.json`, `metrics.json`, and `report.md`.
 
 ```bash
 topology-pretrain stage2-prepare --config configs/stage2_qwen3_8b_qa.yaml

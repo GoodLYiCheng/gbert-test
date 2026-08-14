@@ -112,11 +112,44 @@ def _load_torch(path: Path):
         return torch.load(path, map_location="cpu")
 
 
+def _load_stage1_payload(run_dir: Path) -> tuple[dict, Path, str]:
+    export_path = run_dir / "topology_encoder.pt"
+    if export_path.is_file():
+        payload = _load_torch(export_path)
+        return payload, export_path, "encoder_export"
+
+    checkpoint_path = run_dir / "best.pt"
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            "Stage 1 model not found; expected either "
+            f"{export_path} or {checkpoint_path}"
+        )
+    # best.pt is produced by this repository and contains RNG/optimizer state
+    # that is not accepted by PyTorch's restricted weights-only loader.
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except TypeError:  # PyTorch < 2.0 compatibility.
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Stage 1 best.pt must contain a checkpoint dictionary")
+    config = checkpoint.get("config")
+    if not isinstance(config, dict):
+        raise ValueError("Stage 1 best.pt is missing its config dictionary")
+    hidden_dim = int(config.get("hidden_dim", -1))
+    payload = {
+        "encoder": checkpoint.get("encoder"),
+        "input_contract": "internal fixed all-one vector; ignores data.x",
+        "input_dim": hidden_dim,
+        "output_dim": hidden_dim,
+        "layers": 2,
+        "aggregation": "sum-gin",
+    }
+    return payload, checkpoint_path, "training_checkpoint"
+
+
 def validate_stage1_artifact(stage1_run_dir: Path, allow_smoke: bool = False) -> tuple[TopologyEncoder, dict]:
     run_dir = Path(stage1_run_dir)
-    export_path = run_dir / "topology_encoder.pt"
-    if not export_path.is_file():
-        raise FileNotFoundError(f"Stage 1 export not found: {export_path}")
+    payload, artifact_path, artifact_type = _load_stage1_payload(run_dir)
     evidence_paths = {
         "run_manifest": run_dir / "run_manifest.json",
         "metrics": run_dir / "metrics.json",
@@ -130,7 +163,6 @@ def validate_stage1_artifact(stage1_run_dir: Path, allow_smoke: bool = False) ->
             ". Use allow_smoke_artifact only for engineering checks."
         )
 
-    payload = _load_torch(export_path)
     expected = {
         "input_dim": 128,
         "output_dim": 128,
@@ -156,8 +188,13 @@ def validate_stage1_artifact(stage1_run_dir: Path, allow_smoke: bool = False) ->
     encoder.requires_grad_(False)
     provenance = {
         "run_dir": str(run_dir.resolve()),
-        "export_path": str(export_path.resolve()),
-        "export_sha256": sha256_file(export_path),
+        "artifact_type": artifact_type,
+        "artifact_path": str(artifact_path.resolve()),
+        "artifact_sha256": sha256_file(artifact_path),
+        # Backward-compatible provenance keys used by existing Stage 2
+        # manifests; for a best.pt fallback these identify the checkpoint.
+        "export_path": str(artifact_path.resolve()),
+        "export_sha256": sha256_file(artifact_path),
         "contract": {key: payload[key] for key in (*expected, "input_contract")},
         "engineering_only": engineering_only,
         "missing_formal_evidence": missing,
